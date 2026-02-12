@@ -1,0 +1,610 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mule xmlns:db="http://www.mulesoft.org/schema/mule/db"
+      xmlns:ee="http://www.mulesoft.org/schema/mule/ee/core"
+      xmlns:http="http://www.mulesoft.org/schema/mule/http"
+      xmlns:aws-s3="http://www.mulesoft.org/schema/mule/aws-s3"
+      xmlns="http://www.mulesoft.org/schema/mule/core"
+      xmlns:doc="http://www.mulesoft.org/schema/mule/documentation"
+      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xsi:schemaLocation="
+          http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+          http://www.mulesoft.org/schema/mule/db http://www.mulesoft.org/schema/mule/db/current/mule-db.xsd
+          http://www.mulesoft.org/schema/mule/ee/core http://www.mulesoft.org/schema/mule/ee/core/current/mule-ee.xsd
+          http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+          http://www.mulesoft.org/schema/mule/aws-s3 http://www.mulesoft.org/schema/mule/aws-s3/current/mule-aws-s3.xsd">
+
+    <configuration-properties file="application.properties" />
+
+    <!-- Database Connector Configuration for AWS Athena -->
+    <db:generic-config name="AthenaDatabaseConfig" 
+                       driverClassName="com.simba.athena.jdbc.Driver"
+                       url="#[p('aws.region') != empty ? 
+                            'jdbc:awsathena://AwsRegion=' ++ p('aws.region') ++ 
+                            ';S3OutputLocation=' ++ p('aws.s3.output.location') ++ 
+                            (p('aws.athena.workgroup') != empty ? ';Workgroup=' ++ p('aws.athena.workgroup') : '') ++ ';'
+                            : 'jdbc:awsathena://AwsRegion=us-east-1;S3OutputLocation=s3://your-bucket/results/;']"
+                       user="#[p('aws.access.key')]"
+                       password="#[p('aws.secret.key')]"
+                       doc:name="Athena Database Config">
+        <db:pool>
+            <db:connection-pooling-profile initialSize="#[p('db.pool.initialSize')]"
+                                           minSize="#[p('db.pool.minSize')]"
+                                           maxSize="#[p('db.pool.maxSize')]"
+                                           idleTimeout="#[p('db.pool.idleTimeout')]"
+                                           maxWait="#[p('db.pool.maxWait')]"
+                                           connectionTimeout="10000"/>
+        </db:pool>
+        <db:driver-property key="queryTimeout" value="#[p('db.query.timeout')]"/>
+    </db:generic-config>
+
+    <!-- HTTP Listener Configuration -->
+    <http:listener-config name="HTTP_Listener_config" 
+                          host="#[p('http.host')]" 
+                          port="#[p('http.port')]"
+                          doc:name="HTTP Listener configuration">
+        <http:response-builder>
+            <http:headers><![CDATA[#[output application/java
+---
+{
+    "Content-Type" : "application/json"
+}]]]></http:headers>
+        </http:response-builder>
+    </http:listener-config>
+
+    <!-- AWS S3 Connector Configuration -->
+    <aws-s3:config name="AWS_S3_Config"
+                   accessKeyId="#[p('aws.access.key')]"
+                   secretAccessKey="#[p('aws.secret.key')]"
+                   region="#[p('aws.region')]"
+                   doc:name="AWS S3 Config"/>
+
+    <!-- HTTP Request Configuration for Athena REST API -->
+    <http:request-config name="AthenaRESTAPI_Request_configuration"
+                         basePath="/"
+                         host="athena.#[p('aws.region')].amazonaws.com"
+                         protocol="HTTPS"
+                         port="443"
+                         doc:name="Athena REST API Request configuration">
+        <http:request-builder>
+            <http:headers><![CDATA[#[output application/java
+---
+{
+    "Content-Type" : "application/x-amz-json-1.1",
+    "X-Amz-Target" : "AmazonAthena.StartQueryExecution"
+}]]]></http:headers>
+        </http:request-builder>
+    </http:request-config>
+
+    <!-- Global Error Handler -->
+    <error-handler name="GlobalErrorHandler">
+        <on-error-continue type="DB:QUERY_EXECUTION" logException="true" doc:name="Query Execution Error">
+            <logger level="ERROR" message="Athena query execution error: #[error.description]" doc:name="Log Query Error"/>
+            <ee:transform doc:name="Error Response">
+                <ee:message>
+                    <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{
+    "error": "QUERY_EXECUTION_ERROR",
+    "message": error.description,
+    "cause": error.cause.message default ""
+}]]></ee:set-payload>
+                </ee:message>
+                <ee:set-status-code value="500"/>
+            </ee:transform>
+        </on-error-continue>
+        
+        <on-error-continue type="DB:CONNECTIVITY" logException="true" doc:name="Connectivity Error">
+            <logger level="ERROR" message="Athena connectivity error: #[error.description]" doc:name="Log Connectivity Error"/>
+            <ee:transform doc:name="Error Response">
+                <ee:message>
+                    <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{
+    "error": "CONNECTIVITY_ERROR",
+    "message": "Unable to connect to AWS Athena. Please check your credentials and network connectivity.",
+    "cause": error.cause.message default ""
+}]]></ee:set-payload>
+                </ee:message>
+                <ee:set-status-code value="503"/>
+            </ee:transform>
+        </on-error-continue>
+
+        <on-error-continue type="HTTP:BAD_REQUEST" logException="true" doc:name="Bad Request Error">
+            <logger level="WARN" message="Bad request: #[error.description]" doc:name="Log Bad Request"/>
+            <ee:transform doc:name="Error Response">
+                <ee:message>
+                    <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{
+    "error": "BAD_REQUEST",
+    "message": error.description
+}]]></ee:set-payload>
+                </ee:message>
+                <ee:set-status-code value="400"/>
+            </ee:transform>
+        </on-error-continue>
+
+        <on-error-continue type="EXPRESSION" logException="true" doc:name="Expression Error">
+            <logger level="ERROR" message="Expression error: #[error.description]" doc:name="Log Expression Error"/>
+            <ee:transform doc:name="Error Response">
+                <ee:message>
+                    <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{
+    "error": "EXPRESSION_ERROR",
+    "message": error.description
+}]]></ee:set-payload>
+                </ee:message>
+                <ee:set-status-code value="500"/>
+            </ee:transform>
+        </on-error-continue>
+    </error-handler>
+
+    <!-- Synchronous Query Flow -->
+    <flow name="synchronousQueryFlow" doc:name="synchronousQueryFlow">
+        <http:listener path="#[p('api.base.path')]/query" 
+                       config-ref="HTTP_Listener_config" 
+                       allowedMethods="POST" 
+                       doc:name="Synchronous Query Endpoint"/>
+        
+        <ee:transform doc:name="Extract Query">
+            <ee:message>
+                <ee:set-variable variableName="sqlQuery"><![CDATA[%dw 2.0
+output application/java
+---
+payload.query default ""]]></ee:set-variable>
+            </ee:message>
+        </ee:transform>
+
+        <choice doc:name="Validate Query">
+            <when expression="#[vars.sqlQuery == empty]">
+                <ee:transform doc:name="Validation Error">
+                    <ee:message>
+                        <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{
+    "error": "VALIDATION_ERROR",
+    "message": "Query parameter is required"
+}]]></ee:set-payload>
+                        </ee:message>
+                        <ee:set-status-code value="400"/>
+                    </ee:transform>
+            </when>
+            <otherwise>
+                <db:select config-ref="AthenaDatabaseConfig" doc:name="Execute Query">
+                    <db:sql>#[vars.sqlQuery]</db:sql>
+                </db:select>
+                
+                <ee:transform doc:name="Format Response">
+                    <ee:message>
+                        <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{
+    "status": "SUCCESS",
+    "query": vars.sqlQuery,
+    "rowCount": sizeOf(payload),
+    "results": payload
+}]]></ee:set-payload>
+                        </ee:message>
+                    </ee:transform>
+                </otherwise>
+        </choice>
+
+        <error-handler>
+            <on-error-continue type="DB:QUERY_EXECUTION" logException="true" doc:name="Query Execution Error">
+                <choice doc:name="Check Error Type">
+                    <when expression="#[error.cause.message contains 'TooManyRequestsException' or error.cause.message contains 'ThrottlingException']">
+                        <logger level="WARN" message="Athena throttled - backing off" doc:name="Log Throttling"/>
+                        <until-successful maxRetries="#[p('retry.maxRetries')]" 
+                                         millisBetweenRetries="#[p('retry.millisBetweenRetries')]" 
+                                         doc:name="Retry with Backoff">
+                            <db:select config-ref="AthenaDatabaseConfig" doc:name="Retry Query">
+                                <db:sql>#[vars.sqlQuery]</db:sql>
+                            </db:select>
+                        </until-successful>
+                    </when>
+                    <when expression="#[error.cause.message contains 'ICEBERG_MISSING_METADATA']">
+                        <logger level="ERROR" message="Iceberg metadata error - requires operational check" doc:name="Log Iceberg Error"/>
+                        <ee:transform doc:name="Iceberg Error Response">
+                            <ee:message>
+                                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{
+    "error": "ICEBERG_METADATA_ERROR",
+    "message": "Iceberg table metadata is missing or corrupted. Please contact the data engineering team.",
+    "details": error.cause.message
+}]]></ee:set-payload>
+                            </ee:message>
+                            <ee:set-status-code value="500"/>
+                        </ee:transform>
+                    </when>
+                </choice>
+            </on-error-continue>
+        </error-handler>
+    </flow>
+
+    <!-- Asynchronous Query Execution Flow -->
+    <flow name="asyncQueryFlow" doc:name="asyncQueryFlow">
+        <http:listener path="#[p('api.base.path')]/query/async" 
+                       config-ref="HTTP_Listener_config" 
+                       allowedMethods="POST" 
+                       doc:name="Async Query Endpoint"/>
+        
+        <ee:transform doc:name="Prepare Athena Request">
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{
+    "QueryString": payload.query,
+    "ResultConfiguration": {
+        "OutputLocation": p('aws.s3.output.location')
+    },
+    "WorkGroup": p('aws.athena.workgroup') default ""
+}]]></ee:set-payload>
+                </ee:message>
+                <ee:set-variable variableName="queryString" value="#[payload.query]"/>
+            </ee:transform>
+
+        <http:request method="POST" 
+                     path="/" 
+                     config-ref="AthenaRESTAPI_Request_configuration" 
+                     doc:name="Start Query Execution">
+            <http:request-builder>
+                <http:headers><![CDATA[#[output application/java
+---
+{
+    "Content-Type" : "application/x-amz-json-1.1",
+    "X-Amz-Target" : "AmazonAthena.StartQueryExecution"
+}]]]></http:headers>
+            </http:request-builder>
+        </http:request>
+
+        <ee:transform doc:name="Extract Execution ID">
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{
+    "status": "QUEUED",
+    "executionId": payload.QueryExecutionId,
+    "query": vars.queryString,
+    "statusEndpoint": p('api.base.path') ++ "/query/" ++ payload.QueryExecutionId ++ "/status",
+    "resultsEndpoint": p('api.base.path') ++ "/query/" ++ payload.QueryExecutionId ++ "/results"
+}]]></ee:set-payload>
+                </ee:message>
+            </ee:transform>
+    </flow>
+
+    <!-- Query Status Flow -->
+    <flow name="queryStatusFlow" doc:name="queryStatusFlow">
+        <http:listener path="#[p('api.base.path')]/query/{executionId}/status" 
+                       config-ref="HTTP_Listener_config" 
+                       allowedMethods="GET" 
+                       doc:name="Query Status Endpoint"/>
+        
+        <ee:transform doc:name="Prepare Status Request">
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{
+    "QueryExecutionId": attributes.uriParams.executionId
+}]]></ee:set-payload>
+                </ee:message>
+            </ee:transform>
+
+        <http:request method="POST" 
+                     path="/" 
+                     config-ref="AthenaRESTAPI_Request_configuration" 
+                     doc:name="Get Query Execution">
+            <http:request-builder>
+                <http:headers><![CDATA[#[output application/java
+---
+{
+    "Content-Type" : "application/x-amz-json-1.1",
+    "X-Amz-Target" : "AmazonAthena.GetQueryExecution"
+}]]]></http:headers>
+            </http:request-builder>
+        </http:request>
+
+        <ee:transform doc:name="Format Status Response">
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{
+    "executionId": payload.QueryExecution.QueryExecutionId,
+    "status": payload.QueryExecution.Status.State,
+    "query": payload.QueryExecution.Query,
+    "submissionDateTime": payload.QueryExecution.Status.SubmissionDateTime,
+    "completionDateTime": payload.QueryExecution.Status.CompletionDateTime default "",
+    "stateChangeReason": payload.QueryExecution.Status.StateChangeReason default "",
+    "dataScannedInBytes": payload.QueryExecution.Statistics.DataScannedInBytes default 0,
+    "executionTimeInMillis": payload.QueryExecution.Statistics.ExecutionTimeInMillis default 0
+}]]></ee:set-payload>
+                </ee:message>
+            </ee:transform>
+    </flow>
+
+    <!-- Query Results Flow -->
+    <flow name="queryResultsFlow" doc:name="queryResultsFlow">
+        <http:listener path="#[p('api.base.path')]/query/{executionId}/results" 
+                       config-ref="HTTP_Listener_config" 
+                       allowedMethods="GET" 
+                       doc:name="Query Results Endpoint"/>
+        
+        <ee:transform doc:name="Prepare Results Request">
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{
+    "QueryExecutionId": attributes.uriParams.executionId,
+    "MaxResults": attributes.queryParams.limit default p('pagination.defaultLimit')
+}]]></ee:set-payload>
+                </ee:message>
+            </ee:transform>
+
+        <http:request method="POST" 
+                     path="/" 
+                     config-ref="AthenaRESTAPI_Request_configuration" 
+                     doc:name="Get Query Results">
+            <http:request-builder>
+                <http:headers><![CDATA[#[output application/java
+---
+{
+    "Content-Type" : "application/x-amz-json-1.1",
+    "X-Amz-Target" : "AmazonAthena.GetQueryResults"
+}]]]></http:headers>
+            </http:request-builder>
+        </http:request>
+
+        <ee:transform doc:name="Format Results Response">
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{
+    "executionId": attributes.uriParams.executionId,
+    "resultSet": {
+        "columnInfo": payload.ResultSet.ResultSetMetadata.ColumnInfo,
+        "rows": payload.ResultSet.Rows map (row, index) -> {
+            "rowNumber": index,
+            "data": row.Data
+        }
+    },
+    "nextToken": payload.NextToken default ""
+}]]></ee:set-payload>
+                </ee:message>
+            </ee:transform>
+    </flow>
+
+    <!-- CTAS Pattern Flow for Large Datasets -->
+    <flow name="ctasQueryFlow" doc:name="ctasQueryFlow">
+        <http:listener path="#[p('api.base.path')]/query/ctas" 
+                       config-ref="HTTP_Listener_config" 
+                       allowedMethods="POST" 
+                       doc:name="CTAS Query Endpoint"/>
+        
+        <ee:transform doc:name="Build CTAS Query">
+            <ee:message>
+                <ee:set-variable variableName="sourceQuery"><![CDATA[%dw 2.0
+output application/java
+---
+payload.query default ""]]></ee:set-variable>
+                <ee:set-variable variableName="outputTable"><![CDATA[%dw 2.0
+output application/java
+---
+payload.outputTable default "ctas_results_" ++ now() as String {format: "yyyyMMddHHmmss"}]]></ee:set-variable>
+                <ee:set-variable variableName="s3Location"><![CDATA[%dw 2.0
+output application/java
+---
+p('aws.s3.output.location') ++ vars.outputTable ++ "/"]]></ee:set-variable>
+                <ee:set-variable variableName="ctasQuery"><![CDATA[%dw 2.0
+output application/java
+---
+"CREATE TABLE " ++ vars.outputTable ++ " WITH (format = 'PARQUET', external_location = '" ++ vars.s3Location ++ "') AS " ++ vars.sourceQuery]]></ee:set-variable>
+            </ee:message>
+        </ee:transform>
+
+        <db:execute config-ref="AthenaDatabaseConfig" doc:name="Execute CTAS">
+            <db:sql>#[vars.ctasQuery]</db:sql>
+        </db:execute>
+
+        <ee:transform doc:name="Extract S3 Path">
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{
+    "status": "SUCCESS",
+    "tableName": vars.outputTable,
+    "s3Location": vars.s3Location,
+    "message": "CTAS query completed. Results are available in S3.",
+    "downloadEndpoint": p('api.base.path') ++ "/query/ctas/" ++ vars.outputTable ++ "/download"
+}]]></ee:set-payload>
+                </ee:message>
+            </ee:transform>
+    </flow>
+
+    <!-- CTAS Download Flow -->
+    <flow name="ctasDownloadFlow" doc:name="ctasDownloadFlow">
+        <http:listener path="#[p('api.base.path')]/query/ctas/{tableName}/download" 
+                       config-ref="HTTP_Listener_config" 
+                       allowedMethods="GET" 
+                       doc:name="CTAS Download Endpoint"/>
+        
+        <ee:transform doc:name="Extract S3 Path">
+            <ee:message>
+                <ee:set-variable variableName="s3Path"><![CDATA[%dw 2.0
+output application/java
+---
+p('aws.s3.output.location') ++ attributes.uriParams.tableName ++ "/"]]></ee:set-variable>
+            </ee:message>
+        </ee:transform>
+
+        <aws-s3:list-objects config-ref="AWS_S3_Config" 
+                             bucketName="#[vars.s3Path splitBy('/')[1]]" 
+                             prefix="#[vars.s3Path substringAfter(vars.s3Path splitBy('/')[1] ++ '/')]" 
+                             doc:name="List S3 Objects"/>
+
+        <ee:transform doc:name="Format Download Response">
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{
+    "tableName": attributes.uriParams.tableName,
+    "files": payload map (file) -> {
+        "key": file.Key,
+        "size": file.Size,
+        "lastModified": file.LastModified
+    }
+}]]></ee:set-payload>
+                </ee:message>
+            </ee:transform>
+    </flow>
+
+    <!-- Transactional Flow (Iceberg) -->
+    <flow name="transactionalFlow" doc:name="transactionalFlow">
+        <http:listener path="#[p('api.base.path')]/transaction" 
+                       config-ref="HTTP_Listener_config" 
+                       allowedMethods="POST" 
+                       doc:name="Transactional Endpoint"/>
+        
+        <ee:transform doc:name="Build Transaction Query">
+            <ee:message>
+                <ee:set-variable variableName="tableName"><![CDATA[%dw 2.0
+output application/java
+---
+payload.tableName default p('athena.table.transactional')]]></ee:set-variable>
+                <ee:set-variable variableName="operations"><![CDATA[%dw 2.0
+output application/java
+---
+payload.operations default []]]></ee:set-variable>
+                <ee:set-variable variableName="transactionQuery"><![CDATA[%dw 2.0
+output application/java
+---
+"START TRANSACTION;\n" ++ 
+(vars.operations joinBy ";\n") ++ 
+";\nCOMMIT;"]]></ee:set-variable>
+            </ee:message>
+        </ee:transform>
+
+        <db:execute config-ref="AthenaDatabaseConfig" doc:name="Execute Transaction">
+            <db:sql>#[vars.transactionQuery]</db:sql>
+        </db:execute>
+
+        <ee:transform doc:name="Format Transaction Response">
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{
+    "status": "SUCCESS",
+    "message": "Transaction committed successfully",
+    "tableName": vars.tableName,
+    "operationsCount": sizeOf(vars.operations)
+}]]></ee:set-payload>
+                </ee:message>
+            </ee:transform>
+
+        <error-handler>
+            <on-error-continue type="DB:QUERY_EXECUTION" logException="true" doc:name="Transaction Error">
+                <logger level="ERROR" message="Transaction failed: #[error.description]" doc:name="Log Transaction Error"/>
+                <ee:transform doc:name="Transaction Error Response">
+                    <ee:message>
+                        <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{
+    "status": "FAILED",
+    "error": "TRANSACTION_ERROR",
+    "message": "Transaction was rolled back",
+    "details": error.cause.message default ""
+}]]></ee:set-payload>
+                        </ee:message>
+                        <ee:set-status-code value="500"/>
+                    </ee:transform>
+                </on-error-continue>
+        </error-handler>
+    </flow>
+
+    <!-- Analytical Flow (Parquet) -->
+    <flow name="analyticalFlow" doc:name="analyticalFlow">
+        <http:listener path="#[p('api.base.path')]/analytics" 
+                       config-ref="HTTP_Listener_config" 
+                       allowedMethods="POST" 
+                       doc:name="Analytical Endpoint"/>
+        
+        <ee:transform doc:name="Build Optimized Query">
+            <ee:message>
+                <ee:set-variable variableName="tableName"><![CDATA[%dw 2.0
+output application/java
+---
+payload.tableName default p('athena.table.analytical')]]></ee:set-variable>
+                <ee:set-variable variableName="columns"><![CDATA[%dw 2.0
+output application/java
+---
+payload.columns default "*"]]></ee:set-variable>
+                <ee:set-variable variableName="partitionFilter"><![CDATA[%dw 2.0
+output application/java
+---
+payload.partitionFilter default ""]]></ee:set-variable>
+                <ee:set-variable variableName="whereClause"><![CDATA[%dw 2.0
+output application/java
+---
+payload.whereClause default ""]]></ee:set-variable>
+                <ee:set-variable variableName="limit"><![CDATA[%dw 2.0
+output application/java
+---
+payload.limit default p('pagination.defaultLimit')]]></ee:set-variable>
+                <ee:set-variable variableName="optimizedQuery"><![CDATA[%dw 2.0
+output application/java
+---
+"SELECT " ++ vars.columns ++ " FROM " ++ vars.tableName ++ 
+(if (vars.partitionFilter != empty) " WHERE " ++ vars.partitionFilter else "") ++
+(if (vars.whereClause != empty) (if (vars.partitionFilter != empty) " AND " else " WHERE ") ++ vars.whereClause else "") ++
+" LIMIT " ++ vars.limit]]></ee:set-variable>
+            </ee:message>
+        </ee:transform>
+
+        <choice doc:name="Validate Partition Filter">
+            <when expression="#[vars.partitionFilter == empty and vars.tableName contains 'parquet']">
+                <logger level="WARN" message="Warning: Query without partition filter may result in full table scan and high costs" doc:name="Log Partition Warning"/>
+            </when>
+        </choice>
+
+        <db:select config-ref="AthenaDatabaseConfig" doc:name="Execute Analytical Query">
+            <db:sql>#[vars.optimizedQuery]</db:sql>
+        </db:select>
+
+        <ee:transform doc:name="Format Analytical Response">
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{
+    "status": "SUCCESS",
+    "query": vars.optimizedQuery,
+    "tableName": vars.tableName,
+    "rowCount": sizeOf(payload),
+    "results": payload,
+    "optimization": {
+        "partitionFilterUsed": vars.partitionFilter != empty,
+        "columnsSelected": vars.columns != "*"
+    }
+}]]></ee:set-payload>
+                </ee:message>
+            </ee:transform>
+    </flow>
+
+</mule>
