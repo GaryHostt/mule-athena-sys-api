@@ -55,15 +55,24 @@
             IMPORTANT: The Simba Athena JDBC Driver is not available in Maven Central.
             You must install it manually to your local Maven repository or a private Nexus/Exchange instance.
             
+            Current Version: 2.0.38
+            - Compatible with Mule Runtime 4.10+ and JDK 17
+            - Tested and verified with this implementation
+            
+            v3.x Upgrade Path:
+            - v3.x series is available but not tested with this implementation
+            - If upgrading: verify compatibility, test all endpoints, review AWS docs for breaking changes
+            - Update version number below and reinstall driver
+            
             Installation Steps:
             1. Download the driver from: https://docs.aws.amazon.com/athena/latest/ug/connect-with-jdbc.html
-            2. Extract the JAR file (e.g., AthenaJDBC42-2.x.x.jar)
+            2. Extract the JAR file (e.g., AthenaJDBC42-2.0.38.jar)
             3. Install to local repository:
                mvn install:install-file \
-                 -Dfile=AthenaJDBC42-2.x.x.jar \
+                 -Dfile=AthenaJDBC42-2.0.38.jar \
                  -DgroupId=com.simba.athena \
                  -DartifactId=athena-jdbc \
-                 -Dversion=2.x.x \
+                 -Dversion=2.0.38 \
                  -Dpackaging=jar
             
             For production, consider publishing to a private Maven repository.

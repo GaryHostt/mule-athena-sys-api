@@ -90,8 +90,17 @@ output application/json
 ---
 {
     "error": "QUERY_EXECUTION_ERROR",
+    "errorCode": "ATHENA_QUERY_FAILED",
     "message": error.description,
-    "cause": error.cause.message default ""
+    "cause": error.cause.message default "",
+    "troubleshooting": [
+        "Check query syntax in AWS Athena Console",
+        "Verify table and column names exist",
+        "Check IAM permissions for Athena and S3",
+        "Review query timeout settings (db.query.timeout)",
+        "For large queries, consider using async endpoint or CTAS pattern"
+    ],
+    "documentation": "See README Troubleshooting section for detailed guidance"
 }]]></ee:set-payload>
                 </ee:message>
                 <ee:set-status-code value="500"/>
@@ -107,8 +116,18 @@ output application/json
 ---
 {
     "error": "CONNECTIVITY_ERROR",
+    "errorCode": "ATHENA_CONNECTION_FAILED",
     "message": "Unable to connect to AWS Athena. Please check your credentials and network connectivity.",
-    "cause": error.cause.message default ""
+    "cause": error.cause.message default "",
+    "troubleshooting": [
+        "Verify AWS credentials in application.properties or environment variables",
+        "Check network connectivity to AWS (firewall, VPC settings)",
+        "Verify IAM permissions for Athena service",
+        "Ensure TLS 1.2+ support (required for CloudHub 2.0)",
+        "For CloudHub 2.0: Whitelist Private Space static IPs in AWS",
+        "Test connectivity: aws athena list-work-groups --region us-east-1"
+    ],
+    "documentation": "See README Security Considerations and Troubleshooting sections"
 }]]></ee:set-payload>
                 </ee:message>
                 <ee:set-status-code value="503"/>
@@ -176,6 +195,67 @@ p('pagination.idColumn')]]></ee:set-variable>
             </ee:message>
         </ee:transform>
 
+        <ee:transform doc:name="Validate Input">
+            <ee:message>
+                <ee:set-variable variableName="validationErrors"><![CDATA[%dw 2.0
+output application/java
+---
+do {
+    var errors = []
+    
+    // Validate query is not empty
+    if (vars.baseQuery == empty or vars.baseQuery == null)
+        errors = errors + "Query parameter is required"
+    
+    // Validate query length (prevent extremely long queries)
+    if (sizeOf(vars.baseQuery) > 100000)
+        errors = errors + "Query exceeds maximum length of 100,000 characters"
+    
+    // Validate lastSeenId format (must be numeric if provided)
+    if (vars.lastSeenId != empty and vars.lastSeenId != null)
+        if (vars.lastSeenId as Number? == null)
+            errors = errors + "lastSeenId must be a numeric value"
+    
+    // Validate limit (must be positive and within max limit)
+    var maxLimit = p('pagination.maxLimit') as Number
+    if (vars.limit as Number? != null)
+        if (vars.limit as Number <= 0)
+            errors = errors + "Limit must be a positive number"
+        else if (vars.limit as Number > maxLimit)
+            errors = errors + "Limit exceeds maximum of " ++ maxLimit
+    
+    // Basic SQL injection prevention - check for dangerous patterns
+    var upperQuery = upper(vars.baseQuery)
+    var dangerousPatterns = ["DROP TABLE", "DELETE FROM", "TRUNCATE", "ALTER TABLE", "CREATE USER", "GRANT ALL"]
+    var foundDangerous = dangerousPatterns filter (pattern) -> upperQuery contains pattern
+    
+    if (sizeOf(foundDangerous) > 0)
+        errors = errors + "Query contains potentially dangerous SQL operations: " ++ (foundDangerous joinBy ", ")
+    
+    errors
+}]]></ee:set-variable>
+            </ee:message>
+        </ee:transform>
+
+        <choice doc:name="Check Validation Errors">
+            <when expression="#[sizeOf(vars.validationErrors) > 0]">
+                <ee:transform doc:name="Validation Error Response">
+                    <ee:message>
+                        <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{
+    "error": "VALIDATION_ERROR",
+    "message": "Input validation failed",
+    "errors": vars.validationErrors,
+    "errorCode": "INVALID_INPUT"
+}]]></ee:set-payload>
+                        </ee:message>
+                        <ee:set-status-code value="400"/>
+                    </ee:transform>
+            </when>
+        </choice>
+
         <ee:transform doc:name="Build Query with Cursor Pagination">
             <ee:message>
                 <ee:set-variable variableName="sqlQuery"><![CDATA[%dw 2.0
@@ -183,22 +263,74 @@ output application/java
 ---
 if (vars.lastSeenId != empty and vars.lastSeenId != null) 
     do {
-        var upperQuery = upper(vars.baseQuery)
+        // Strip comments to avoid false matches in WHERE detection
+        // Remove single-line comments (-- comment)
+        var queryNoComments = vars.baseQuery replace /--[^\r\n]*/ with ""
+        // Remove multi-line comments (/* comment */)
+        var queryCleaned = queryNoComments replace /\/\*[\s\S]*?\*\// with ""
+        
+        // Convert to uppercase for case-insensitive matching
+        var upperQuery = upper(queryCleaned)
+        
+        // Enhanced WHERE detection - strip comments first, then use case-insensitive search
+        // This handles most edge cases (comments, but not complex subqueries)
+        // For complex queries with subqueries, manual WHERE clause management may be needed
         var hasWhere = upperQuery contains " WHERE "
+        
+        // Check for ORDER BY and LIMIT
         var hasOrderBy = upperQuery contains " ORDER BY "
+        var hasLimit = upperQuery contains " LIMIT "
+        
         var cursorCondition = vars.idColumn ++ " > " ++ vars.lastSeenId
         
+        // Build query with cursor condition
+        // Simple approach: if WHERE exists, append AND; otherwise add WHERE
+        // This works for most common cases. Complex queries with subqueries may need manual handling.
         var queryWithCursor = if (hasWhere)
-            vars.baseQuery ++ " AND " ++ cursorCondition
+            // Find position before ORDER BY or LIMIT to insert AND condition
+            var orderByIdx = upperQuery indexOf " ORDER BY "
+            var limitIdx = upperQuery indexOf " LIMIT "
+            var insertIdx = if (orderByIdx > 0 and limitIdx > 0) min([orderByIdx, limitIdx])
+                           else if (orderByIdx > 0) orderByIdx
+                           else if (limitIdx > 0) limitIdx
+                           else sizeOf(queryCleaned)
+            
+            if (insertIdx < sizeOf(queryCleaned))
+                queryCleaned[0 to insertIdx] ++ " AND " ++ cursorCondition ++ " " ++ queryCleaned[insertIdx to -1]
+            else
+                queryCleaned ++ " AND " ++ cursorCondition
         else
-            vars.baseQuery ++ " WHERE " ++ cursorCondition
+            // No WHERE clause - add one before ORDER BY, LIMIT, or at end
+            var orderByIdx = upperQuery indexOf " ORDER BY "
+            var limitIdx = upperQuery indexOf " LIMIT "
+            var insertIdx = if (orderByIdx > 0 and limitIdx > 0) min([orderByIdx, limitIdx])
+                           else if (orderByIdx > 0) orderByIdx
+                           else if (limitIdx > 0) limitIdx
+                           else sizeOf(queryCleaned)
+            
+            if (insertIdx < sizeOf(queryCleaned))
+                queryCleaned[0 to insertIdx] ++ " WHERE " ++ cursorCondition ++ " " ++ queryCleaned[insertIdx to -1]
+            else
+                queryCleaned ++ " WHERE " ++ cursorCondition
         
+        // Add ORDER BY if not present
         var queryWithOrder = if (hasOrderBy)
             queryWithCursor
         else
-            queryWithCursor ++ " ORDER BY " ++ vars.idColumn
+            var upperWithCursor = upper(queryWithCursor)
+            var limitIdxNew = upperWithCursor indexOf " LIMIT "
+            if (limitIdxNew > 0)
+                queryWithCursor[0 to limitIdxNew] ++ " ORDER BY " ++ vars.idColumn ++ " " ++ queryWithCursor[limitIdxNew to -1]
+            else
+                queryWithCursor ++ " ORDER BY " ++ vars.idColumn
         
-        queryWithOrder ++ " LIMIT " ++ vars.limit
+        // Add LIMIT if not present
+        var finalQuery = if (hasLimit)
+            queryWithOrder
+        else
+            queryWithOrder ++ " LIMIT " ++ vars.limit
+        
+        finalQuery
     } else
         vars.baseQuery]]></ee:set-variable>
             </ee:message>
@@ -271,8 +403,17 @@ output application/json
 ---
 {
     "error": "ICEBERG_METADATA_ERROR",
+    "errorCode": "ICEBERG_METADATA_CORRUPTED",
     "message": "Iceberg table metadata is missing or corrupted. Please contact the data engineering team.",
-    "details": error.cause.message
+    "details": error.cause.message,
+    "troubleshooting": [
+        "Verify S3 metadata location is accessible",
+        "Check for concurrent writes causing metadata conflicts",
+        "Review Iceberg table metadata in S3",
+        "Contact data engineering team for metadata repair",
+        "Consider recreating the Iceberg table if metadata is unrecoverable"
+    ],
+    "documentation": "See README Troubleshooting section: ICEBERG_MISSING_METADATA error"
 }]]></ee:set-payload>
                             </ee:message>
                             <ee:set-status-code value="500"/>
@@ -495,35 +636,113 @@ output application/json
                        allowedMethods="GET" 
                        doc:name="CTAS Download Endpoint"/>
         
-        <ee:transform doc:name="Extract S3 Path">
+        <ee:transform doc:name="Extract Parameters">
             <ee:message>
+                <ee:set-variable variableName="downloadMode"><![CDATA[%dw 2.0
+output application/java
+---
+attributes.queryParams.download default "false"]]></ee:set-variable>
+                <ee:set-variable variableName="presignedUrlMode"><![CDATA[%dw 2.0
+output application/java
+---
+attributes.queryParams.presignedUrl default "false"]]></ee:set-variable>
+                <ee:set-variable variableName="fileKey"><![CDATA[%dw 2.0
+output application/java
+---
+attributes.queryParams.fileKey default ""]]></ee:set-variable>
                 <ee:set-variable variableName="s3Path"><![CDATA[%dw 2.0
 output application/java
 ---
 p('aws.s3.output.location') ++ attributes.uriParams.tableName ++ "/"]]></ee:set-variable>
+                <ee:set-variable variableName="bucketName"><![CDATA[%dw 2.0
+output application/java
+---
+vars.s3Path splitBy('/')[1]]]></ee:set-variable>
+                <ee:set-variable variableName="prefix"><![CDATA[%dw 2.0
+output application/java
+---
+vars.s3Path substringAfter(vars.s3Path splitBy('/')[1] ++ '/')]]></ee:set-variable>
             </ee:message>
         </ee:transform>
 
-        <aws-s3:list-objects config-ref="AWS_S3_Config" 
-                             bucketName="#[vars.s3Path splitBy('/')[1]]" 
-                             prefix="#[vars.s3Path substringAfter(vars.s3Path splitBy('/')[1] ++ '/')]" 
-                             doc:name="List S3 Objects"/>
-
-        <ee:transform doc:name="Format Download Response">
-            <ee:message>
-                <ee:set-payload><![CDATA[%dw 2.0
+        <choice doc:name="Download Mode">
+            <when expression="#[vars.downloadMode == 'true' and vars.fileKey != empty]">
+                <!-- Direct file download -->
+                <aws-s3:get-object config-ref="AWS_S3_Config"
+                                   bucketName="#[vars.bucketName]"
+                                   key="#[vars.fileKey]"
+                                   outputMimeType="application/octet-stream"
+                                   doc:name="Download File from S3"/>
+                <ee:transform doc:name="Set Download Headers">
+                    <ee:message>
+                        <ee:set-variable variableName="fileName"><![CDATA[%dw 2.0
+output application/java
+---
+vars.fileKey splitBy('/')[-1]]]></ee:set-variable>
+                        <ee:set-payload>#[payload]</ee:set-payload>
+                        <ee:set-attributes><![CDATA[%dw 2.0
+output application/java
+---
+{
+    "Content-Type": "application/octet-stream",
+    "Content-Disposition": "attachment; filename=\"" ++ vars.fileName ++ "\""
+}]]></ee:set-attributes>
+                    </ee:message>
+                </ee:transform>
+            </when>
+            <when expression="#[vars.presignedUrlMode == 'true' and vars.fileKey != empty]">
+                <!-- Generate presigned URL -->
+                <aws-s3:generate-presigned-url config-ref="AWS_S3_Config"
+                                              bucketName="#[vars.bucketName]"
+                                              key="#[vars.fileKey]"
+                                              expirationInSeconds="900"
+                                              doc:name="Generate Presigned URL"/>
+                <ee:transform doc:name="Format Presigned URL Response">
+                    <ee:message>
+                        <ee:set-payload><![CDATA[%dw 2.0
 output application/json
 ---
 {
     "tableName": attributes.uriParams.tableName,
+    "fileKey": vars.fileKey,
+    "presignedUrl": payload,
+    "expirationSeconds": 900,
+    "message": "Use this URL to download the file directly from S3. URL expires in 15 minutes."
+}]]></ee:set-payload>
+                        </ee:message>
+                    </ee:transform>
+            </when>
+            <otherwise>
+                <!-- Default: List files -->
+                <aws-s3:list-objects config-ref="AWS_S3_Config" 
+                                     bucketName="#[vars.bucketName]" 
+                                     prefix="#[vars.prefix]" 
+                                     doc:name="List S3 Objects"/>
+
+                <ee:transform doc:name="Format Download Response">
+                    <ee:message>
+                        <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{
+    "tableName": attributes.uriParams.tableName,
+    "s3Location": vars.s3Path,
     "files": payload map (file) -> {
         "key": file.Key,
         "size": file.Size,
-        "lastModified": file.LastModified
+        "lastModified": file.LastModified,
+        "downloadUrl": p('api.base.path') ++ "/query/ctas/" ++ attributes.uriParams.tableName ++ "/download?download=true&fileKey=" ++ (file.Key replace / / with "%20"),
+        "presignedUrlEndpoint": p('api.base.path') ++ "/query/ctas/" ++ attributes.uriParams.tableName ++ "/download?presignedUrl=true&fileKey=" ++ (file.Key replace / / with "%20")
+    },
+    "instructions": {
+        "download": "Add ?download=true&fileKey=<fileKey> to download file directly",
+        "presignedUrl": "Add ?presignedUrl=true&fileKey=<fileKey> to get presigned URL for direct S3 access"
     }
 }]]></ee:set-payload>
-                </ee:message>
-            </ee:transform>
+                        </ee:message>
+                    </ee:transform>
+            </otherwise>
+        </choice>
     </flow>
 
     <!-- Transactional Flow (Iceberg) -->
@@ -533,7 +752,7 @@ output application/json
                        allowedMethods="POST" 
                        doc:name="Transactional Endpoint"/>
         
-        <ee:transform doc:name="Build Transaction Query">
+        <ee:transform doc:name="Extract and Validate Parameters">
             <ee:message>
                 <ee:set-variable variableName="tableName"><![CDATA[%dw 2.0
 output application/java
@@ -543,6 +762,66 @@ payload.tableName default p('athena.table.transactional')]]></ee:set-variable>
 output application/java
 ---
 payload.operations default []]]></ee:set-variable>
+                <ee:set-variable variableName="validationErrors"><![CDATA[%dw 2.0
+output application/java
+---
+do {
+    var errors = []
+    
+    // Validate table name (basic SQL injection prevention)
+    if (vars.tableName != empty)
+        if (vars.tableName contains ";" or vars.tableName contains "--" or vars.tableName contains "/*")
+            errors = errors + "Table name contains invalid characters"
+    
+    // Validate operations array
+    if (sizeOf(vars.operations) == 0)
+        errors = errors + "At least one operation is required"
+    
+    if (sizeOf(vars.operations) > 50)
+        errors = errors + "Maximum of 50 operations allowed per transaction"
+    
+    // Validate each operation (basic checks)
+    var invalidOps = vars.operations filter (op) -> 
+        sizeOf(op) > 10000 or 
+        (upper(op) contains "DROP" or upper(op) contains "TRUNCATE" or upper(op) contains "ALTER")
+    
+    if (sizeOf(invalidOps) > 0)
+        errors = errors + "Operations contain invalid or dangerous SQL statements"
+    
+    errors
+}]]></ee:set-variable>
+            </ee:message>
+        </ee:transform>
+
+        <choice doc:name="Check Validation Errors">
+            <when expression="#[sizeOf(vars.validationErrors) > 0]">
+                <ee:transform doc:name="Validation Error Response">
+                    <ee:message>
+                        <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{
+    "error": "VALIDATION_ERROR",
+    "message": "Input validation failed",
+    "errors": vars.validationErrors,
+    "errorCode": "INVALID_INPUT"
+}]]></ee:set-payload>
+                        </ee:message>
+                        <ee:set-status-code value="400"/>
+                    </ee:transform>
+            </when>
+        </choice>
+
+        <ee:transform doc:name="Build Transaction Query">
+            <ee:message>
+                <ee:set-variable variableName="tableName"><![CDATA[%dw 2.0
+output application/java
+---
+vars.tableName]]></ee:set-variable>
+                <ee:set-variable variableName="operations"><![CDATA[%dw 2.0
+output application/java
+---
+vars.operations]]></ee:set-variable>
                 <ee:set-variable variableName="transactionQuery"><![CDATA[%dw 2.0
 output application/java
 ---
@@ -584,8 +863,18 @@ output application/json
 {
     "status": "FAILED",
     "error": "TRANSACTION_ERROR",
-    "message": "Transaction was rolled back",
-    "details": error.cause.message default ""
+    "errorCode": "ICEBERG_TRANSACTION_ROLLED_BACK",
+    "message": "Transaction was rolled back. ROLLBACK command executed to clean up Iceberg snapshot.",
+    "details": error.cause.message default "",
+    "troubleshooting": [
+        "Transaction automatically rolled back - no manual action needed",
+        "Check individual operation syntax and data validity",
+        "Verify table exists and is an Iceberg table (not Parquet/CSV)",
+        "Check for concurrent transaction conflicts",
+        "Review S3 metadata location accessibility",
+        "Ensure all operations in transaction are valid DML statements"
+    ],
+    "documentation": "See README: Transactional Operations section and Troubleshooting: Iceberg Snapshot Lock"
 }]]></ee:set-payload>
                         </ee:message>
                         <ee:set-status-code value="500"/>
@@ -601,12 +890,68 @@ output application/json
                        allowedMethods="POST" 
                        doc:name="Analytical Endpoint"/>
         
-        <ee:transform doc:name="Build Optimized Query">
+        <ee:transform doc:name="Extract and Validate Parameters">
             <ee:message>
                 <ee:set-variable variableName="tableName"><![CDATA[%dw 2.0
 output application/java
 ---
 payload.tableName default p('athena.table.analytical')]]></ee:set-variable>
+                <ee:set-variable variableName="validationErrors"><![CDATA[%dw 2.0
+output application/java
+---
+do {
+    var errors = []
+    
+    // Validate table name (basic SQL injection prevention)
+    if (vars.tableName != empty)
+        if (vars.tableName contains ";" or vars.tableName contains "--" or vars.tableName contains "/*")
+            errors = errors + "Table name contains invalid characters"
+    
+    // Validate limit if provided
+    var limit = payload.limit default p('pagination.defaultLimit')
+    var maxLimit = p('pagination.maxLimit') as Number
+    if (limit as Number? != null)
+        if (limit as Number <= 0)
+            errors = errors + "Limit must be a positive number"
+        else if (limit as Number > maxLimit)
+            errors = errors + "Limit exceeds maximum of " ++ maxLimit
+    
+    // Validate lastSeenId format if provided
+    var lastSeenId = payload.lastSeenId default ""
+    if (lastSeenId != empty and lastSeenId != null)
+        if (lastSeenId as Number? == null)
+            errors = errors + "lastSeenId must be a numeric value"
+    
+    errors
+}]]></ee:set-variable>
+            </ee:message>
+        </ee:transform>
+
+        <choice doc:name="Check Validation Errors">
+            <when expression="#[sizeOf(vars.validationErrors) > 0]">
+                <ee:transform doc:name="Validation Error Response">
+                    <ee:message>
+                        <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{
+    "error": "VALIDATION_ERROR",
+    "message": "Input validation failed",
+    "errors": vars.validationErrors,
+    "errorCode": "INVALID_INPUT"
+}]]></ee:set-payload>
+                        </ee:message>
+                        <ee:set-status-code value="400"/>
+                    </ee:transform>
+            </when>
+        </choice>
+
+        <ee:transform doc:name="Build Optimized Query">
+            <ee:message>
+                <ee:set-variable variableName="tableName"><![CDATA[%dw 2.0
+output application/java
+---
+vars.tableName]]></ee:set-variable>
                 <ee:set-variable variableName="columns"><![CDATA[%dw 2.0
 output application/java
 ---

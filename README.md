@@ -120,9 +120,18 @@ Create a policy with the following permissions:
 3. Select the policy you created
 4. Click "Next" → "Add permissions"
 
-### 5. (Optional) Create Athena Workgroup
+### 5. Create Athena Workgroup (Recommended for Production)
 
-Workgroups provide governance and cost control:
+**⚠️ Production Best Practice**: Workgroups are **highly recommended** for production deployments. They provide critical governance, cost control, and query result location enforcement.
+
+**Benefits**:
+- **Cost Control**: Set per-query data scanned limits (e.g., 10GB max)
+- **Governance**: Enforce query result location (specific S3 bucket)
+- **Cost Allocation**: Tag queries for billing tracking
+- **Query History**: Centralized query logging and monitoring
+- **Performance**: Query result caching configuration
+
+**Setup Steps**:
 
 1. Navigate to Athena Console
 2. Go to "Workgroups" → "Create workgroup"
@@ -142,7 +151,13 @@ The Simba Athena JDBC Driver is not available in Maven Central. You must install
 #### Download the Driver
 
 1. Visit: https://docs.aws.amazon.com/athena/latest/ug/connect-with-jdbc.html
-2. Download the latest JDBC driver (recommended: v2.x series for Mule 4.10+)
+2. Download the JDBC driver version **2.0.38** (used in this project)
+   - **Current Version**: This project uses v2.0.38, which is compatible with Mule Runtime 4.10+ and JDK 17
+   - **v3.x Series**: Available but not tested with this implementation. If upgrading to v3.x:
+     - Verify compatibility with Mule Runtime 4.10+
+     - Test all endpoints thoroughly
+     - Update `pom.xml` dependency version
+     - Review AWS documentation for breaking changes
 3. Extract the JAR file (e.g., `AthenaJDBC42-2.0.38.jar`)
 
 #### Install to Local Maven Repository
@@ -194,7 +209,8 @@ aws.secret.key=YOUR_ACTUAL_SECRET_KEY
 # S3 Output Location
 aws.s3.output.location=s3://your-athena-results-bucket/results/
 
-# Athena Workgroup (optional)
+# Athena Workgroup (recommended for production)
+# Create a workgroup in Athena Console and specify the name here
 aws.athena.workgroup=mulesoft-production
 ```
 
@@ -215,7 +231,7 @@ mvn mule:deploy
    - `AWS_ACCESS_KEY`
    - `AWS_SECRET_KEY`
    - `AWS_S3_OUTPUT_LOCATION`
-   - `AWS_ATHENA_WORKGROUP` (optional)
+   - `AWS_ATHENA_WORKGROUP` (recommended for production)
 
 **Important for CloudHub 2.0**:
 - Whitelist Static Source IPs of your Private Space in AWS IAM/VPC policies
@@ -233,7 +249,7 @@ All configuration is managed through `src/main/resources/application.properties`
 | `aws.access.key` | AWS Access Key ID | - | Yes |
 | `aws.secret.key` | AWS Secret Access Key | - | Yes |
 | `aws.s3.output.location` | S3 bucket for query results | - | Yes |
-| `aws.athena.workgroup` | Athena workgroup name | (empty) | No |
+| `aws.athena.workgroup` | Athena workgroup name | (empty) | **Recommended** for production |
 | `db.pool.maxSize` | Maximum connection pool size | 5 | No |
 | `db.pool.connectionTimeout` | Connection wait timeout (ms) | 5000 | No |
 | `db.query.timeout` | Query timeout in milliseconds | 300000 (5 min) | No |
@@ -256,11 +272,132 @@ export AWS_SECRET_KEY=...
 export AWS_S3_OUTPUT_LOCATION=s3://my-bucket/results/
 ```
 
+### Configuration Examples
+
+#### Example 1: Query Timeout Configuration
+
+**Scenario**: Queries typically take 2-3 minutes, but some may take up to 10 minutes.
+
+```properties
+# Set query timeout to 10 minutes (600000 ms)
+db.query.timeout=600000
+```
+
+**For long-running queries** (> 10 minutes), use the async pattern instead:
+```bash
+# Use async endpoint for queries that may take > 10 minutes
+curl -X POST http://localhost:8081/api/athena/query/async \
+  -H "Content-Type: application/json" \
+  -d '{"query": "SELECT * FROM very_large_table"}'
+```
+
+#### Example 2: Connection Pool Tuning
+
+**Scenario**: High concurrency with queries averaging 45 seconds.
+
+```properties
+# Increase pool size for more concurrent queries
+db.pool.maxSize=10
+
+# Increase connection timeout to handle query completion time
+# Formula: (Average Query Time / 2) + Buffer = (45000 / 2) + 5000 = 27500ms
+db.pool.connectionTimeout=30000
+```
+
+**Calculation**:
+- Average query time: 45 seconds (45000ms)
+- Recommended timeout: 30000ms (30 seconds) - allows time for queries to complete
+- Pool size: 10 connections (if Athena quota allows)
+
+#### Example 3: CloudHub 2.0 Configuration
+
+**Using Environment Variables** (Recommended):
+
+```bash
+# Set in CloudHub 2.0 environment variables
+AWS_REGION=us-east-1
+AWS_ACCESS_KEY=AKIA...
+AWS_SECRET_KEY=...
+AWS_S3_OUTPUT_LOCATION=s3://my-athena-results/results/
+AWS_ATHENA_WORKGROUP=mulesoft-production
+DB_SSL_ENABLED=true
+DB_POOL_CONNECTION_TIMEOUT=10000
+DB_QUERY_TIMEOUT=300000
+```
+
+**Using application.properties** (Override in deployment):
+
+```properties
+# CloudHub 2.0 specific settings
+db.ssl.enabled=true
+db.pool.connectionTimeout=10000
+db.query.timeout=300000
+aws.athena.workgroup=mulesoft-production
+```
+
+#### Example 4: Secrets Manager Integration
+
+**Note**: MuleSoft doesn't have built-in Secrets Manager integration. Use one of these approaches:
+
+**Option A: External Secrets Manager** (Recommended for production):
+1. Use Anypoint Secrets Manager or HashiCorp Vault
+2. Retrieve secrets at application startup
+3. Set as environment variables or system properties
+
+**Option B: AWS Secrets Manager via HTTP Connector**:
+```xml
+<!-- Retrieve secret at startup -->
+<http:request method="POST" 
+             url="https://secretsmanager.us-east-1.amazonaws.com/"
+             config-ref="AWS_Secrets_Config">
+    <!-- AWS Signature V4 authentication required -->
+</http:request>
+```
+
+**Option C: Environment Variables** (Simplest):
+- Set secrets as environment variables in CloudHub 2.0
+- Properties file uses `${AWS_ACCESS_KEY:default}` syntax
+- Secrets are injected at runtime
+
+#### Example 5: Production Configuration
+
+**Complete production setup**:
+
+```properties
+# AWS Configuration
+aws.region=us-east-1
+aws.access.key=${AWS_ACCESS_KEY}
+aws.secret.key=${AWS_SECRET_KEY}
+aws.s3.output.location=${AWS_S3_OUTPUT_LOCATION}
+aws.athena.workgroup=${AWS_ATHENA_WORKGROUP:mulesoft-production}
+
+# Connection Pool (tuned for production)
+db.pool.initialSize=2
+db.pool.minSize=2
+db.pool.maxSize=8
+db.pool.idleTimeout=60000
+db.pool.maxWait=15000
+db.pool.connectionTimeout=15000
+
+# Query Configuration
+db.query.timeout=600000
+
+# SSL/TLS (required for CloudHub 2.0)
+db.ssl.enabled=${DB_SSL_ENABLED:true}
+
+# Pagination
+pagination.defaultLimit=10000
+pagination.maxLimit=50000
+pagination.idColumn=id
+```
+
 ## API Endpoints
 
 ### 1. Synchronous Query Execution
 
-Execute a SQL query and receive results immediately (for small datasets <5GB).
+Execute a SQL query and receive results immediately.
+
+**⚠️ Important**: This endpoint is suitable for small to medium datasets. For large result sets, use the CTAS pattern endpoint.
 
 **Endpoint**: `POST /api/athena/query`
 
@@ -490,6 +627,47 @@ Execute optimized analytical queries with partition filtering.
 - Use `lastSeenId` from the response for the next page request
 - Avoids OFFSET costs - Athena doesn't scan and discard rows before the offset point
 
+## Result Set Size Limits
+
+### JDBC Driver Limitations
+
+**⚠️ Critical**: The Athena JDBC driver has a **5GB result set limit** when using synchronous queries.
+
+- **Synchronous Query Endpoint** (`POST /api/athena/query`): 
+  - Maximum result set size: **~5GB** (loaded into Mule worker heap)
+  - Exceeding this limit will cause `OutOfMemoryError`
+  - **Recommendation**: Use for datasets < 1GB to ensure safety margin
+
+- **Asynchronous Query Endpoint** (`POST /api/athena/query/async`):
+  - No JDBC driver limit (results stored in S3)
+  - Suitable for any result set size
+  - Use for datasets > 1GB or when result size is unknown
+
+### When to Use CTAS Pattern
+
+Use the **CTAS Pattern** (`POST /api/athena/query/ctas`) for:
+- Result sets > 100MB
+- Result sets approaching 1GB (safety margin)
+- When you need to process results in batches
+- When results will be accessed multiple times
+
+**Benefits**:
+- Results stored in S3 as Parquet (columnar format, compressed)
+- No memory limitations
+- Can download files directly or use presigned URLs
+- Efficient for large datasets
+
+### Monitoring Result Sizes
+
+Monitor query result sizes to prevent issues:
+
+1. **Check Query Statistics**: Use the status endpoint to get `dataScannedInBytes`
+2. **Estimate Result Size**: Typically 10-50% of data scanned (depends on columns selected)
+3. **Set Alarms**: Configure CloudWatch alarms for queries scanning >10GB
+4. **Use Workgroups**: Set data scanned limits per query (e.g., 10GB max)
+
+**Example**: If a query scans 50GB but only selects 3 columns, result size might be ~5-10GB. Use CTAS pattern.
+
 ## Usage Examples
 
 ### Example 1: Simple Synchronous Query
@@ -588,7 +766,22 @@ curl -X POST http://localhost:8081/api/athena/query \
    - Default: max 5 connections per worker
    - Adjust based on your Athena quota (default: 25 concurrent queries)
    - Formula: `maxPoolSize = (Athena Quota / Number of Workers) - Buffer`
-   - **Connection Wait Strategy**: Configure `db.pool.connectionTimeout` (default: 5000ms) to wait for available connections during high concurrency bursts, preventing immediate "Could not obtain connection" errors
+   
+   **Connection Wait Strategy** (`db.pool.connectionTimeout`):
+   - **Default**: 5000ms (5 seconds)
+   - **Purpose**: When all connections in the pool are busy, new requests wait for an available connection instead of failing immediately
+   - **Behavior**: 
+     - If a connection becomes available within the timeout period, the request proceeds
+     - If timeout expires, the request fails with "Could not obtain connection" error
+   - **Tuning Guidance**:
+     - **Short queries** (< 30 seconds): 5000ms is usually sufficient
+     - **Medium queries** (30 seconds - 2 minutes): Increase to 10000-15000ms
+     - **Long queries** (> 2 minutes): Consider using async pattern instead
+     - **High concurrency**: Increase timeout to 10000-20000ms to handle bursts
+   - **Formula**: `connectionTimeout = (Average Query Time / 2) + Buffer`
+     - Example: Average query = 60s, use 30000ms (30s) + 5000ms buffer = 35000ms
+   - **Trade-off**: Longer timeout = better request success rate but slower failure detection
+   - **Monitoring**: Track "Could not obtain connection" errors - if frequent, increase timeout or pool size
 
 2. **Query Timeouts**
    - Set appropriate timeouts based on SLA
@@ -686,6 +879,178 @@ The API includes comprehensive error handling for common scenarios:
 2. **Separate Credentials**: Use different IAM users/roles per environment
 3. **Rotate Keys**: Regularly rotate access keys
 4. **Monitor Access**: Enable CloudTrail for audit logging
+
+## Monitoring & Observability
+
+### CloudWatch Alarms
+
+Set up CloudWatch alarms to monitor Athena query performance and costs:
+
+#### 1. Query Execution Time Alarm
+
+**Purpose**: Alert when queries exceed expected execution time
+
+```json
+{
+  "AlarmName": "Athena-Query-Execution-Time-High",
+  "MetricName": "QueryExecutionTime",
+  "Namespace": "AWS/Athena",
+  "Statistic": "Average",
+  "Period": 300,
+  "EvaluationPeriods": 1,
+  "Threshold": 300000,
+  "ComparisonOperator": "GreaterThanThreshold",
+  "AlarmActions": ["arn:aws:sns:us-east-1:ACCOUNT:athena-alerts"]
+}
+```
+
+**Recommended Thresholds**:
+- Warning: > 5 minutes (300000 ms)
+- Critical: > 10 minutes (600000 ms)
+
+#### 2. Failed Queries Alarm
+
+**Purpose**: Alert on query failures
+
+```json
+{
+  "AlarmName": "Athena-Query-Failures",
+  "MetricName": "QueryFailures",
+  "Namespace": "AWS/Athena",
+  "Statistic": "Sum",
+  "Period": 300,
+  "EvaluationPeriods": 1,
+  "Threshold": 5,
+  "ComparisonOperator": "GreaterThanThreshold"
+}
+```
+
+#### 3. Throttling Exception Alarm
+
+**Purpose**: Alert when hitting Athena concurrent query limits
+
+```json
+{
+  "AlarmName": "Athena-Throttling-Exceptions",
+  "MetricName": "ThrottlingException",
+  "Namespace": "AWS/Athena",
+  "Statistic": "Sum",
+  "Period": 60,
+  "EvaluationPeriods": 1,
+  "Threshold": 1,
+  "ComparisonOperator": "GreaterThanOrEqualToThreshold"
+}
+```
+
+#### 4. Data Scanned Alarm
+
+**Purpose**: Alert on queries scanning excessive data (cost control)
+
+```json
+{
+  "AlarmName": "Athena-Data-Scanned-High",
+  "MetricName": "DataScannedInBytes",
+  "Namespace": "AWS/Athena",
+  "Statistic": "Sum",
+  "Period": 300,
+  "EvaluationPeriods": 1,
+  "Threshold": 10737418240,
+  "ComparisonOperator": "GreaterThanThreshold"
+}
+```
+
+**Threshold**: 10GB (10737418240 bytes) - adjust based on your cost tolerance
+
+### CloudWatch Dashboard
+
+Create a dashboard to visualize Athena metrics:
+
+**Key Metrics to Monitor**:
+- Query execution time (p50, p95, p99)
+- Failed query count
+- Data scanned per query
+- Throttling exceptions
+- Query cost (estimated from data scanned)
+
+**Dashboard JSON Template**:
+
+```json
+{
+  "widgets": [
+    {
+      "type": "metric",
+      "properties": {
+        "metrics": [
+          ["AWS/Athena", "QueryExecutionTime", {"stat": "Average"}],
+          [".", ".", {"stat": "p95"}],
+          [".", ".", {"stat": "p99"}]
+        ],
+        "period": 300,
+        "stat": "Average",
+        "region": "us-east-1",
+        "title": "Query Execution Time"
+      }
+    },
+    {
+      "type": "metric",
+      "properties": {
+        "metrics": [
+          ["AWS/Athena", "DataScannedInBytes", {"stat": "Sum"}]
+        ],
+        "period": 300,
+        "stat": "Sum",
+        "region": "us-east-1",
+        "title": "Data Scanned (Bytes)"
+      }
+    },
+    {
+      "type": "metric",
+      "properties": {
+        "metrics": [
+          ["AWS/Athena", "QueryFailures", {"stat": "Sum"}]
+        ],
+        "period": 300,
+        "stat": "Sum",
+        "region": "us-east-1",
+        "title": "Failed Queries"
+      }
+    }
+  ]
+}
+```
+
+### Query Cost Tracking
+
+**Estimate Query Costs**:
+- Athena charges $5 per TB of data scanned
+- Formula: `Cost = (DataScannedInBytes / 1099511627776) * 5`
+- Example: 100GB scanned = $0.50 per query
+
+**Cost Optimization**:
+1. Use partition filters (reduce data scanned by 50-90%)
+2. Select specific columns (not `SELECT *`)
+3. Use Parquet/ORC format (columnar, compressed)
+4. Set workgroup data scanned limits
+5. Monitor and alert on high-cost queries
+
+**Cost Allocation Tags**:
+- Tag workgroups with cost allocation tags
+- Track costs by application, environment, team
+- Use AWS Cost Explorer to analyze Athena spending
+
+### Application-Level Monitoring
+
+Monitor Mule application metrics:
+
+1. **Connection Pool Usage**: Track active/idle connections
+2. **Query Timeout Rate**: Monitor queries exceeding timeout
+3. **Error Rates**: Track DB:QUERY_EXECUTION and DB:CONNECTIVITY errors
+4. **Response Times**: Monitor API endpoint latency
+
+**Recommended Log Levels**:
+- Production: INFO (log query execution, errors)
+- Debugging: DEBUG (log SQL queries, connection pool status)
+- Development: TRACE (detailed flow execution)
 
 ## Troubleshooting
 
