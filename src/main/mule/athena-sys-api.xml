@@ -5,7 +5,7 @@
       xmlns:aws-s3="http://www.mulesoft.org/schema/mule/aws-s3"
       xmlns="http://www.mulesoft.org/schema/mule/core"
       xmlns:doc="http://www.mulesoft.org/schema/mule/documentation"
-      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+  xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
       xsi:schemaLocation="
           http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
           http://www.mulesoft.org/schema/mule/db http://www.mulesoft.org/schema/mule/db/current/mule-db.xsd
@@ -32,9 +32,13 @@
                                            maxSize="#[p('db.pool.maxSize')]"
                                            idleTimeout="#[p('db.pool.idleTimeout')]"
                                            maxWait="#[p('db.pool.maxWait')]"
-                                           connectionTimeout="10000"/>
+                                           connectionTimeout="#[p('db.pool.connectionTimeout')]"/>
         </db:pool>
         <db:driver-property key="queryTimeout" value="#[p('db.query.timeout')]"/>
+        <db:connection-properties>
+            <db:connection-property key="SSL" value="#[p('db.ssl.enabled') == 'true' ? '1' : '0']"/>
+            <db:connection-property key="SSLTrustStore" value="#[p('db.ssl.enabled') == 'true' and p('db.ssl.trustStorePath') != empty ? p('db.ssl.trustStorePath') : '']"/>
+        </db:connection-properties>
     </db:generic-config>
 
     <!-- HTTP Listener Configuration -->
@@ -151,17 +155,57 @@ output application/json
                        allowedMethods="POST" 
                        doc:name="Synchronous Query Endpoint"/>
         
-        <ee:transform doc:name="Extract Query">
+        <ee:transform doc:name="Extract Query and Pagination">
+            <ee:message>
+                <ee:set-variable variableName="baseQuery"><![CDATA[%dw 2.0
+output application/java
+---
+payload.query default ""]]></ee:set-variable>
+                <ee:set-variable variableName="lastSeenId"><![CDATA[%dw 2.0
+output application/java
+---
+payload.lastSeenId default ""]]></ee:set-variable>
+                <ee:set-variable variableName="limit"><![CDATA[%dw 2.0
+output application/java
+---
+payload.limit default p('pagination.defaultLimit')]]></ee:set-variable>
+                <ee:set-variable variableName="idColumn"><![CDATA[%dw 2.0
+output application/java
+---
+p('pagination.idColumn')]]></ee:set-variable>
+            </ee:message>
+        </ee:transform>
+
+        <ee:transform doc:name="Build Query with Cursor Pagination">
             <ee:message>
                 <ee:set-variable variableName="sqlQuery"><![CDATA[%dw 2.0
 output application/java
 ---
-payload.query default ""]]></ee:set-variable>
+if (vars.lastSeenId != empty and vars.lastSeenId != null) 
+    do {
+        var upperQuery = upper(vars.baseQuery)
+        var hasWhere = upperQuery contains " WHERE "
+        var hasOrderBy = upperQuery contains " ORDER BY "
+        var cursorCondition = vars.idColumn ++ " > " ++ vars.lastSeenId
+        
+        var queryWithCursor = if (hasWhere)
+            vars.baseQuery ++ " AND " ++ cursorCondition
+        else
+            vars.baseQuery ++ " WHERE " ++ cursorCondition
+        
+        var queryWithOrder = if (hasOrderBy)
+            queryWithCursor
+        else
+            queryWithCursor ++ " ORDER BY " ++ vars.idColumn
+        
+        queryWithOrder ++ " LIMIT " ++ vars.limit
+    } else
+        vars.baseQuery]]></ee:set-variable>
             </ee:message>
         </ee:transform>
 
         <choice doc:name="Validate Query">
-            <when expression="#[vars.sqlQuery == empty]">
+            <when expression="#[vars.baseQuery == empty]">
                 <ee:transform doc:name="Validation Error">
                     <ee:message>
                         <ee:set-payload><![CDATA[%dw 2.0
@@ -180,8 +224,15 @@ output application/json
                     <db:sql>#[vars.sqlQuery]</db:sql>
                 </db:select>
                 
-                <ee:transform doc:name="Format Response">
+                <ee:transform doc:name="Format Response with Pagination">
                     <ee:message>
+                        <ee:set-variable variableName="lastRowId"><![CDATA[%dw 2.0
+output application/java
+---
+if (sizeOf(payload) > 0)
+    payload[-1][vars.idColumn] default payload[-1][upper(vars.idColumn)] default ""
+else
+    ""]]></ee:set-variable>
                         <ee:set-payload><![CDATA[%dw 2.0
 output application/json
 ---
@@ -189,7 +240,9 @@ output application/json
     "status": "SUCCESS",
     "query": vars.sqlQuery,
     "rowCount": sizeOf(payload),
-    "results": payload
+    "results": payload,
+    "lastSeenId": vars.lastRowId,
+    "hasMore": sizeOf(payload) == vars.limit
 }]]></ee:set-payload>
                         </ee:message>
                     </ee:transform>
@@ -520,6 +573,9 @@ output application/json
         <error-handler>
             <on-error-continue type="DB:QUERY_EXECUTION" logException="true" doc:name="Transaction Error">
                 <logger level="ERROR" message="Transaction failed: #[error.description]" doc:name="Log Transaction Error"/>
+                <db:execute-script config-ref="AthenaDatabaseConfig" doc:name="Rollback Transaction">
+                    <db:sql>ROLLBACK;</db:sql>
+                </db:execute-script>
                 <ee:transform doc:name="Transaction Error Response">
                     <ee:message>
                         <ee:set-payload><![CDATA[%dw 2.0
@@ -563,17 +619,49 @@ payload.partitionFilter default ""]]></ee:set-variable>
 output application/java
 ---
 payload.whereClause default ""]]></ee:set-variable>
+                <ee:set-variable variableName="lastSeenId"><![CDATA[%dw 2.0
+output application/java
+---
+payload.lastSeenId default ""]]></ee:set-variable>
                 <ee:set-variable variableName="limit"><![CDATA[%dw 2.0
 output application/java
 ---
 payload.limit default p('pagination.defaultLimit')]]></ee:set-variable>
+                <ee:set-variable variableName="idColumn"><![CDATA[%dw 2.0
+output application/java
+---
+p('pagination.idColumn')]]></ee:set-variable>
                 <ee:set-variable variableName="optimizedQuery"><![CDATA[%dw 2.0
 output application/java
 ---
-"SELECT " ++ vars.columns ++ " FROM " ++ vars.tableName ++ 
-(if (vars.partitionFilter != empty) " WHERE " ++ vars.partitionFilter else "") ++
-(if (vars.whereClause != empty) (if (vars.partitionFilter != empty) " AND " else " WHERE ") ++ vars.whereClause else "") ++
-" LIMIT " ++ vars.limit]]></ee:set-variable>
+do {
+    var baseWhere = if (vars.partitionFilter != empty) 
+        " WHERE " ++ vars.partitionFilter 
+    else 
+        ""
+    
+    var whereWithClause = if (vars.whereClause != empty)
+        if (vars.partitionFilter != empty)
+            baseWhere ++ " AND " ++ vars.whereClause
+        else
+            " WHERE " ++ vars.whereClause
+    else
+        baseWhere
+    
+    var whereWithCursor = if (vars.lastSeenId != empty and vars.lastSeenId != null)
+        if (whereWithClause != "")
+            whereWithClause ++ " AND " ++ vars.idColumn ++ " > " ++ vars.lastSeenId
+        else
+            " WHERE " ++ vars.idColumn ++ " > " ++ vars.lastSeenId
+    else
+        whereWithClause
+    
+    var queryWithOrder = "SELECT " ++ vars.columns ++ " FROM " ++ vars.tableName ++ whereWithCursor ++ 
+        " ORDER BY " ++ vars.idColumn ++ 
+        " LIMIT " ++ vars.limit
+    
+    queryWithOrder
+}]]></ee:set-variable>
             </ee:message>
         </ee:transform>
 
@@ -589,6 +677,13 @@ output application/java
 
         <ee:transform doc:name="Format Analytical Response">
             <ee:message>
+                <ee:set-variable variableName="lastRowId"><![CDATA[%dw 2.0
+output application/java
+---
+if (sizeOf(payload) > 0)
+    payload[-1][vars.idColumn] default payload[-1][upper(vars.idColumn)] default ""
+else
+    ""]]></ee:set-variable>
                 <ee:set-payload><![CDATA[%dw 2.0
 output application/json
 ---
@@ -598,13 +693,16 @@ output application/json
     "tableName": vars.tableName,
     "rowCount": sizeOf(payload),
     "results": payload,
+    "lastSeenId": vars.lastRowId,
+    "hasMore": sizeOf(payload) == vars.limit,
     "optimization": {
         "partitionFilterUsed": vars.partitionFilter != empty,
-        "columnsSelected": vars.columns != "*"
+        "columnsSelected": vars.columns != "*",
+        "cursorPaginationUsed": vars.lastSeenId != empty and vars.lastSeenId != null
     }
 }]]></ee:set-payload>
                 </ee:message>
             </ee:transform>
     </flow>
-
+  
 </mule>

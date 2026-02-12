@@ -235,11 +235,15 @@ All configuration is managed through `src/main/resources/application.properties`
 | `aws.s3.output.location` | S3 bucket for query results | - | Yes |
 | `aws.athena.workgroup` | Athena workgroup name | (empty) | No |
 | `db.pool.maxSize` | Maximum connection pool size | 5 | No |
+| `db.pool.connectionTimeout` | Connection wait timeout (ms) | 5000 | No |
 | `db.query.timeout` | Query timeout in milliseconds | 300000 (5 min) | No |
+| `db.ssl.enabled` | Enable SSL for JDBC connections | false | No |
+| `db.ssl.trustStorePath` | Custom SSL truststore path | (empty) | No |
 | `http.port` | HTTP listener port | 8081 | No |
 | `api.base.path` | API base path | /api/athena | No |
 | `athena.table.transactional` | Iceberg table name | iceberg_orders | No |
 | `athena.table.analytical` | Parquet table name | parquet_sales_log | No |
+| `pagination.idColumn` | Column name for cursor pagination | id | No |
 
 ### Environment Variables
 
@@ -263,25 +267,40 @@ Execute a SQL query and receive results immediately (for small datasets <5GB).
 **Request Body**:
 ```json
 {
-    "query": "SELECT id, name, amount FROM sales_data WHERE year=2026 AND month=02 AND amount > 1000 LIMIT 1000"
+    "query": "SELECT id, name, amount FROM sales_data WHERE year=2026 AND month=02 AND amount > 1000",
+    "lastSeenId": 12345,
+    "limit": 10000
 }
 ```
+
+**Query Parameters**:
+- `query` (required): SQL query to execute
+- `lastSeenId` (optional): For cursor-based pagination - returns rows where id > lastSeenId
+- `limit` (optional): Maximum number of rows to return (default: 10000)
 
 **Response**:
 ```json
 {
     "status": "SUCCESS",
-    "query": "SELECT id, name, amount FROM sales_data WHERE year=2026 AND month=02 AND amount > 1000 LIMIT 1000",
-    "rowCount": 1000,
+    "query": "SELECT id, name, amount FROM sales_data WHERE year=2026 AND month=02 AND amount > 1000 AND id > 12345 ORDER BY id LIMIT 10000",
+    "rowCount": 10000,
     "results": [
         {
-            "id": 1,
+            "id": 12346,
             "name": "Product A",
             "amount": 1500.00
         }
-    ]
+    ],
+    "lastSeenId": 22345,
+    "hasMore": true
 }
 ```
+
+**Cursor-Based Pagination**:
+- When `lastSeenId` is provided, the query automatically adds `WHERE id > :lastSeenId` (or `AND id > :lastSeenId` if WHERE already exists)
+- Results are automatically ordered by the ID column
+- Use `lastSeenId` from the response for the next page request
+- This avoids OFFSET costs - Athena doesn't scan and discard rows before the offset point
 
 ### 2. Asynchronous Query Execution
 
@@ -419,6 +438,7 @@ Execute ACID transactions on Iceberg tables.
 - Only works with Apache Iceberg tables
 - Standard Athena tables (CSV/JSON/Parquet without Iceberg) do NOT support transaction syntax
 - Uses `START TRANSACTION` and `COMMIT` syntax
+- **Automatic ROLLBACK**: If a transaction fails, the API automatically executes `ROLLBACK` to clean up pending/locked Iceberg snapshots, preventing snapshot lock issues
 
 ### 7. Analytical Queries (Parquet)
 
@@ -433,24 +453,42 @@ Execute optimized analytical queries with partition filtering.
     "columns": "id, name, amount, date",
     "partitionFilter": "year=2026 AND month=02",
     "whereClause": "amount > 1000",
+    "lastSeenId": 12345,
     "limit": 10000
 }
 ```
+
+**Query Parameters**:
+- `tableName` (optional): Table name (defaults to configured analytical table)
+- `columns` (optional): Comma-separated column list (default: "*")
+- `partitionFilter` (recommended): Partition filter to reduce data scanned
+- `whereClause` (optional): Additional WHERE conditions
+- `lastSeenId` (optional): For cursor-based pagination - returns rows where id > lastSeenId
+- `limit` (optional): Maximum number of rows (default: 10000)
 
 **Response**:
 ```json
 {
     "status": "SUCCESS",
-    "query": "SELECT id, name, amount, date FROM parquet_sales_log WHERE year=2026 AND month=02 AND amount > 1000 LIMIT 10000",
+    "query": "SELECT id, name, amount, date FROM parquet_sales_log WHERE year=2026 AND month=02 AND amount > 1000 AND id > 12345 ORDER BY id LIMIT 10000",
     "tableName": "parquet_sales_log",
     "rowCount": 5000,
     "results": [...],
+    "lastSeenId": 22345,
+    "hasMore": false,
     "optimization": {
         "partitionFilterUsed": true,
-        "columnsSelected": true
+        "columnsSelected": true,
+        "cursorPaginationUsed": true
     }
 }
 ```
+
+**Cursor-Based Pagination**:
+- When `lastSeenId` is provided, the query automatically adds `AND id > :lastSeenId` to the WHERE clause
+- Results are automatically ordered by the ID column (configured via `pagination.idColumn` property)
+- Use `lastSeenId` from the response for the next page request
+- Avoids OFFSET costs - Athena doesn't scan and discard rows before the offset point
 
 ## Usage Examples
 
@@ -498,6 +536,30 @@ curl -X POST http://localhost:8081/api/athena/query/ctas \
   }'
 ```
 
+### Example 4: Cursor-Based Pagination
+
+```bash
+# First page (no lastSeenId)
+RESPONSE=$(curl -X POST http://localhost:8081/api/athena/query \
+  -H "Content-Type: application/json" \
+  -d '{
+    "query": "SELECT id, name, amount FROM sales_data WHERE year=2026",
+    "limit": 10000
+  }')
+
+# Extract lastSeenId from response
+LAST_ID=$(echo $RESPONSE | jq -r '.lastSeenId')
+
+# Next page using cursor
+curl -X POST http://localhost:8081/api/athena/query \
+  -H "Content-Type: application/json" \
+  -d "{
+    \"query\": \"SELECT id, name, amount FROM sales_data WHERE year=2026\",
+    \"lastSeenId\": $LAST_ID,
+    \"limit\": 10000
+  }"
+```
+
 ## Best Practices
 
 ### Cost Optimization
@@ -526,6 +588,7 @@ curl -X POST http://localhost:8081/api/athena/query/ctas \
    - Default: max 5 connections per worker
    - Adjust based on your Athena quota (default: 25 concurrent queries)
    - Formula: `maxPoolSize = (Athena Quota / Number of Workers) - Buffer`
+   - **Connection Wait Strategy**: Configure `db.pool.connectionTimeout` (default: 5000ms) to wait for available connections during high concurrency bursts, preventing immediate "Could not obtain connection" errors
 
 2. **Query Timeouts**
    - Set appropriate timeouts based on SLA
@@ -533,9 +596,11 @@ curl -X POST http://localhost:8081/api/athena/query/ctas \
    - Long-running queries: Use async pattern
 
 3. **Pagination**
-   - Use cursor-based pagination for large datasets
-   - Avoid OFFSET (scans all data up to offset point)
-   - Example: `WHERE id > :lastSeenId ORDER BY id LIMIT 10000`
+   - **Use cursor-based pagination** for large datasets (built into the API)
+   - ❌ BAD: `SELECT * FROM table LIMIT 10000 OFFSET 1000000` (scans and discards 1M rows)
+   - ✅ GOOD: Use `lastSeenId` parameter - `WHERE id > :lastSeenId ORDER BY id LIMIT 10000`
+   - The API automatically handles cursor-based pagination when `lastSeenId` is provided
+   - Example: First request without `lastSeenId`, then use `lastSeenId` from response for next page
 
 ### Concurrent Query Management
 
@@ -599,9 +664,13 @@ The API includes comprehensive error handling for common scenarios:
 
 ### Network Security
 
-1. **TLS Requirements**: 
+1. **SSL/TLS Configuration**: 
    - TLS 1.2+ required (TLS 1.0/1.1 deprecated as of January 2026)
-   - Ensure JDBC connection strings support TLS 1.2+
+   - **Enable SSL for JDBC connections**: Set `db.ssl.enabled=true` in `application.properties`
+   - **CloudHub 2.0**: SSL is especially critical - always enable for production deployments
+   - **RTF**: SSL works for both CloudHub 2.0 and RTF deployments
+   - **Custom Truststore**: Optionally configure `db.ssl.trustStorePath` if using a custom truststore
+   - The API automatically enforces SSL=1 in connection properties when enabled
 
 2. **CloudHub 2.0 Static IPs**:
    - Whitelist Private Space static IPs in AWS IAM/VPC policies
@@ -679,6 +748,15 @@ mvn install:install-file \
 **Problem**: Attempting to use transactions on non-Iceberg tables.
 
 **Solution**: Only use transactional flows with Iceberg tables. Use analytical flows for Parquet/CSV/JSON tables.
+
+#### 7. "Iceberg Snapshot Lock" or "Pending Transaction" Error
+
+**Problem**: Iceberg transaction failed but snapshot remains in locked/pending state.
+
+**Solution**: The API automatically executes `ROLLBACK` in the error handler to clean up failed transactions. If you still see this error, check:
+- Network connectivity during transaction execution
+- Concurrent transaction conflicts
+- S3 metadata location accessibility
 
 ### Debugging Tips
 
